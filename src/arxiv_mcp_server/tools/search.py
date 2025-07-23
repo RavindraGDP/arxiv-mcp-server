@@ -2,6 +2,7 @@
 
 import arxiv
 import json
+from .arxiv_modified import MyArxivClient
 from typing import Dict, Any, List
 from datetime import datetime, timezone
 from dateutil import parser
@@ -21,27 +22,11 @@ search_tool = types.Tool(
             "date_from": {"type": "string"},
             "date_to": {"type": "string"},
             "categories": {"type": "array", "items": {"type": "string"}},
+            "sort_by_method": {"type": "string", "enum": ["submitted", "relevance"]},
         },
         "required": ["query"],
     },
 )
-
-
-def _is_within_date_range(
-    date: datetime, start: datetime | None, end: datetime | None
-) -> bool:
-    """Check if a date falls within the specified range."""
-    if start and not start.tzinfo:
-        start = start.replace(tzinfo=timezone.utc)
-    if end and not end.tzinfo:
-        end = end.replace(tzinfo=timezone.utc)
-
-    if start and date < start:
-        return False
-    if end and date > end:
-        return False
-    return True
-
 
 def _process_paper(paper: arxiv.Result) -> Dict[str, Any]:
     """Process paper information with resource URI."""
@@ -56,7 +41,50 @@ def _process_paper(paper: arxiv.Result) -> Dict[str, Any]:
         "resource_uri": f"arxiv://{paper.get_short_id()}",
     }
 
+def _build_query(arguments: Dict[str, Any]) -> str:
+    # Build search query in arXiv API format: cat:quant-ph+AND+submittedDate:[200903192000+TO+200903232000]
+    query_parts = []
 
+    # Handle category (use first if multiple, or join with +OR+ if you want all)
+    categories = arguments.get("categories")
+    if categories:
+        # If you want just one category, use the first:
+        category_str = f"cat:{categories[0]}"
+        # If you want all categories, join with +OR+:
+        # category_str = '+OR+'.join(f"cat:{cat}" for cat in categories)
+        query_parts.append(category_str)
+    
+    # Handle main query (plain text or with field)
+    query = arguments["query"]
+    if not any(field in query for field in ["all:", "ti:", "abs:", "au:", "cat:"]):
+        if '"' in query:
+            query_str = f"all:{query}"
+        else:
+            terms = query.split()
+            if len(terms) > 1:
+                query_str = '+AND+'.join(f"all:{term}" for term in terms)
+            else:
+                query_str = f"all:{query}"
+    else:
+        query_str = query.replace(' ', '+AND+')
+    query_parts.append(query_str)
+
+    # Handle date range
+    date_from = '197001010000'
+    date_to = datetime.now(timezone.utc).strftime('%Y%m%d%H%M')
+    if arguments.get("date_from"):
+        date_from = parser.parse(arguments["date_from"]).strftime('%Y%m%d%H%M')
+    if arguments.get("date_to"):
+        date_to = parser.parse(arguments["date_to"]).strftime('%Y%m%d%H%M')
+    date_str = f"submittedDate:[{date_from}+TO+{date_to}]"
+    query_parts.append(date_str)
+
+    # Join all parts with +AND+
+    return '+AND+'.join(query_parts)
+
+    
+    
+    
 async def handle_search(arguments: Dict[str, Any]) -> List[types.TextContent]:
     """Handle paper search requests.
 
@@ -64,61 +92,28 @@ async def handle_search(arguments: Dict[str, Any]) -> List[types.TextContent]:
     This fixes issue #33 where queries sorted by date returned irrelevant results.
     """
     try:
-        client = arxiv.Client()
+        # return [types.TextContent(type="text", text="I am good")]
+        client = MyArxivClient()
         max_results = min(int(arguments.get("max_results", 10)), settings.MAX_RESULTS)
 
-        # Build search query with category filtering
-        query = arguments["query"]
-
-        # Add field specifier if not already present
-        # This ensures the query actually searches the content
-        if not any(field in query for field in ["all:", "ti:", "abs:", "au:", "cat:"]):
-            # Convert plain query to use all: field for better results
-            # Handle quoted phrases
-            if '"' in query:
-                # Keep quoted phrases intact
-                query = f"all:{query}"
+        # Set default sort criterion
+        sort_by = arxiv.SortCriterion.Relevance
+        if sort_by_method := arguments.get("sort_by_method"):
+            if sort_by_method == "submitted":
+                sort_by = arxiv.SortCriterion.SubmittedDate
             else:
-                # For unquoted multi-word queries, use AND operator
-                terms = query.split()
-                if len(terms) > 1:
-                    query = " AND ".join(f"all:{term}" for term in terms)
-                else:
-                    query = f"all:{query}"
-
-        if categories := arguments.get("categories"):
-            category_filter = " OR ".join(f"cat:{cat}" for cat in categories)
-            query = f"({query}) AND ({category_filter})"
+                sort_by = arxiv.SortCriterion.Relevance
 
         search = arxiv.Search(
-            query=query,
+            query=_build_query(arguments),
             max_results=max_results,
-            sort_by=arxiv.SortCriterion.SubmittedDate,
+            sort_by=sort_by,
         )
 
         # Process results with date filtering
         results = []
-        try:
-            date_from = (
-                parser.parse(arguments["date_from"]).replace(tzinfo=timezone.utc)
-                if "date_from" in arguments
-                else None
-            )
-            date_to = (
-                parser.parse(arguments["date_to"]).replace(tzinfo=timezone.utc)
-                if "date_to" in arguments
-                else None
-            )
-        except (ValueError, TypeError) as e:
-            return [
-                types.TextContent(
-                    type="text", text=f"Error: Invalid date format - {str(e)}"
-                )
-            ]
-
         for paper in client.results(search):
-            if _is_within_date_range(paper.published, date_from, date_to):
-                results.append(_process_paper(paper))
+            results.append(_process_paper(paper))
 
             if len(results) >= max_results:
                 break
