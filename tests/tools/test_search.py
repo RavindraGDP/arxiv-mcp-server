@@ -60,8 +60,11 @@ async def test_search_with_invalid_dates(mock_client):
             {"query": "test query", "date_from": "invalid-date", "max_results": 1}
         )
 
-        # The error message format has changed
-        assert result[0].text.startswith("Error: Unknown string format")
+        # Check for structured error response
+        error_data = json.loads(result[0].text)
+        assert "error" in error_data
+        assert "Unknown string format" in error_data["error"]
+        assert error_data["type"] == "validation_error"
 
 
 @pytest.mark.asyncio
